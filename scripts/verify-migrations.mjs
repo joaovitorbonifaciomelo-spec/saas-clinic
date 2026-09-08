@@ -1968,6 +1968,269 @@ try {
     return true
   })
 
+  // ===========================================================================
+  console.log('\n  === 15. Confirmacoes v0.1: base de banco ===\n')
+
+  const novoProfissionalConf = (userId, clinicId) =>
+    comoUsuario(userId, async () => {
+      const { rows } = await db.query(
+        `insert into public.professionals (clinic_id, name) values ($1,'Prof Confirmacao') returning id`,
+        [clinicId],
+      )
+      return rows[0].id
+    })
+
+  /** Agendamento cujo starts_at fica a N horas de agora (pode ser negativo). */
+  const novoAgendamentoEm = (userId, clinicId, pacienteId, profId, horas) =>
+    comoUsuario(userId, async () => {
+      const { rows } = await db.query(
+        `insert into public.appointments (clinic_id, patient_id, professional_id, starts_at, ends_at)
+         values ($1,$2,$3,
+                 now() + make_interval(hours => $4),
+                 now() + make_interval(hours => $4) + interval '30 minutes')
+         returning id, starts_at, status`,
+        [clinicId, pacienteId, profId, horas],
+      )
+      return rows[0]
+    })
+
+  const scan = (clinicId) => db.query('select public.request_appointment_confirmation_scan($1)', [clinicId])
+
+  const profA = await novoProfissionalConf(userA, clinicA)
+  const profB = await novoProfissionalConf(userB, clinicB)
+
+  await afirma('CHECK aceita source=appointment_confirmation em created', async () => {
+    const t = (await novaTask(userA, clinicA, { title: 'CHECK source ok' })).task
+    await db.query(
+      `insert into public.task_events (clinic_id, task_id, event_type, metadata)
+       values ($1,$2,'created','{"source":"appointment_confirmation"}'::jsonb)`,
+      [clinicA, t.id],
+    )
+    return true
+  })
+
+  await afirmaRecusa(
+    'CHECK rejeita qualquer outro valor de source',
+    async () => {
+      const t = (await novaTask(userA, clinicA, { title: 'CHECK source ruim' })).task
+      await db.query(
+        `insert into public.task_events (clinic_id, task_id, event_type, metadata)
+         values ($1,$2,'created','{"source":"bogus"}'::jsonb)`,
+        [clinicA, t.id],
+      )
+    },
+    '23514',
+  )
+
+  await afirmaRecusa(
+    'CHECK continua rejeitando chave desconhecida em created',
+    async () => {
+      const t = (await novaTask(userA, clinicA, { title: 'CHECK chave estranha' })).task
+      await db.query(
+        `insert into public.task_events (clinic_id, task_id, event_type, metadata)
+         values ($1,$2,'created','{"foo":"bar"}'::jsonb)`,
+        [clinicA, t.id],
+      )
+    },
+    '23514',
+  )
+
+  await afirma('scan abre Task para agendamento elegivel: status, titulo, prazo, contexto, ator', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+
+    const { rows: ag } = await db.query('select status from public.appointments where id = $1', [appt.id])
+    const { rows: tk } = await db.query(
+      `select id, title, due_at, patient_id, appointment_id, status
+         from public.tasks where appointment_id = $1`,
+      [appt.id],
+    )
+    if (ag[0].status !== 'awaiting_confirmation') return false
+    if (tk.length !== 1) return false
+    const t = tk[0]
+    const prazoEsperado = new Date(new Date(appt.starts_at).getTime() - 24 * 3_600_000).toISOString()
+
+    const { rows: ev } = await db.query(
+      `select actor_user_id, actor_name_snapshot, metadata
+         from public.task_events where task_id = $1 and event_type = 'created'`,
+      [t.id],
+    )
+
+    return (
+      t.title === 'Confirmar consulta de Paciente A' &&
+      new Date(t.due_at).toISOString() === prazoEsperado &&
+      t.patient_id === pacienteA &&
+      t.status === 'open' &&
+      ev.length === 1 &&
+      ev[0].actor_user_id === null &&
+      ev[0].actor_name_snapshot === 'Sistema' &&
+      ev[0].metadata.source === 'appointment_confirmation'
+    )
+  })
+
+  await afirma('scan ignora agendamento fora da janela de 24h (muito no futuro)', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 30)
+    await scan(clinicA)
+    const { rows } = await db.query(
+      'select status from public.appointments where id = $1',
+      [appt.id],
+    )
+    return rows[0].status === 'scheduled'
+  })
+
+  await afirma('scan ignora agendamento cujo starts_at ja passou', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, -1)
+    await scan(clinicA)
+    const { rows } = await db.query(
+      'select status from public.appointments where id = $1',
+      [appt.id],
+    )
+    return rows[0].status === 'scheduled'
+  })
+
+  await afirma('scan e escopado: clinica B fica intocada ao varrer clinica A', async () => {
+    const apptB = await novoAgendamentoEm(userB, clinicB, pacienteB, profB, 12)
+    await scan(clinicA)
+    const { rows: ag } = await db.query('select status from public.appointments where id = $1', [apptB.id])
+    const { rows: tk } = await db.query('select count(*)::int as n from public.tasks where appointment_id = $1', [apptB.id])
+    return ag[0].status === 'scheduled' && tk[0].n === 0
+  })
+
+  await afirma('idempotencia: rodar o scan duas vezes nao duplica a Task', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+    await scan(clinicA)
+    const { rows } = await db.query(
+      'select count(*)::int as n from public.tasks where appointment_id = $1',
+      [appt.id],
+    )
+    return rows[0].n === 1
+  })
+
+  await afirmaRecusa(
+    'request_appointment_confirmation_scan NAO e executavel por authenticated nem anon',
+    () => chamarT(userA, 'request_appointment_confirmation_scan', [clinicA]),
+    'permission denied',
+  )
+
+  await afirma('fechamento: confirmed conclui a Task automatica, com o ATOR REAL', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+    const antes = (
+      await db.query('select id, version from public.tasks where appointment_id = $1', [appt.id])
+    ).rows[0]
+
+    await comoUsuario(userA, () =>
+      db.query("update public.appointments set status = 'confirmed' where id = $1", [appt.id]),
+    )
+
+    const { rows: tk } = await db.query(
+      'select status, version, completed_at, completed_by from public.tasks where id = $1',
+      [antes.id],
+    )
+    const { rows: ev } = await db.query(
+      `select actor_user_id from public.task_events
+        where task_id = $1 and event_type = 'completed'`,
+      [antes.id],
+    )
+    return (
+      tk[0].status === 'completed' &&
+      tk[0].version === antes.version + 1 &&
+      tk[0].completed_at !== null &&
+      tk[0].completed_by === userA &&
+      ev.length === 1 &&
+      ev[0].actor_user_id === userA
+    )
+  })
+
+  await afirma('fechamento: reschedule_requested tambem conclui a Task automatica', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+    await comoUsuario(userA, () =>
+      db.query("update public.appointments set status = 'reschedule_requested' where id = $1", [appt.id]),
+    )
+    const { rows } = await db.query('select status from public.tasks where appointment_id = $1', [appt.id])
+    return rows[0].status === 'completed'
+  })
+
+  await afirma('fechamento: cancelled tambem conclui a Task automatica', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+    await comoUsuario(userA, () =>
+      db.query("update public.appointments set status = 'cancelled' where id = $1", [appt.id]),
+    )
+    const { rows } = await db.query('select status from public.tasks where appointment_id = $1', [appt.id])
+    return rows[0].status === 'completed'
+  })
+
+  await afirma('fechamento NAO toca em Task manual do mesmo agendamento', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+    const manual = (
+      await novaTask(userA, clinicA, { title: 'Tarefa manual do mesmo agendamento', appointmentId: appt.id })
+    ).task
+
+    await comoUsuario(userA, () =>
+      db.query("update public.appointments set status = 'confirmed' where id = $1", [appt.id]),
+    )
+
+    const { rows } = await db.query(
+      `select id, status from public.tasks where appointment_id = $1 order by created_at`,
+      [appt.id],
+    )
+    const automatica = rows.find((r) => r.id !== manual.id)
+    const manualDepois = rows.find((r) => r.id === manual.id)
+    return automatica.status === 'completed' && manualDepois.status === 'open'
+  })
+
+  await afirma('reagendar de volta para scheduled dentro da janela gera Task NOVA', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+    const primeira = (
+      await db.query('select id from public.tasks where appointment_id = $1', [appt.id])
+    ).rows[0]
+
+    await comoUsuario(userA, () =>
+      db.query("update public.appointments set status = 'reschedule_requested' where id = $1", [appt.id]),
+    )
+    // Reagenda: novo horario, dentro da janela de novo, e volta para scheduled.
+    await comoUsuario(userA, () =>
+      db.query(
+        `update public.appointments
+            set starts_at = now() + interval '10 hours',
+                ends_at   = now() + interval '10 hours 30 minutes',
+                status    = 'scheduled'
+          where id = $1`,
+        [appt.id],
+      ),
+    )
+    await scan(clinicA)
+
+    const { rows } = await db.query(
+      `select id, status from public.tasks where appointment_id = $1 order by created_at`,
+      [appt.id],
+    )
+    const segunda = rows.find((r) => r.id !== primeira.id)
+    return (
+      rows.length === 2 &&
+      rows.find((r) => r.id === primeira.id).status === 'completed' &&
+      segunda !== undefined &&
+      segunda.status === 'open'
+    )
+  })
+
+  await afirma('close_appointment_confirmation_task NAO e executavel por authenticated nem anon', async () => {
+    for (const papel of ['authenticated', 'anon']) {
+      const { rows } = await db.query('select has_function_privilege($1, $2, $3) as pode', [
+        papel,
+        'public.close_appointment_confirmation_task()',
+        'EXECUTE',
+      ])
+      if (rows[0].pode) return false
+    }
+    return true
+  })
+
 } catch (e) {
   falhou('execucao', e.message)
 } finally {

@@ -205,11 +205,23 @@ export const taskEmptyMetadataSchema = z.object({}).strict()
  * NULL` zera `assigned_to` SEM gerar evento — sem esta chave, quem era o
  * responsavel inicial desapareceria por completo. Mesmo formato de
  * `taskAssigneeSnapshotSchema` usado por `assigned`/`transferred`/`released`,
- * porque vem da mesma funcao SQL (`task_member_snapshot`). Espelha o CHECK
- * `task_events_created_metadata` do banco.
+ * porque vem da mesma funcao SQL (`task_member_snapshot`).
+ *
+ * `source`, opcional, e identidade TECNICA — Confirmacoes v0.1 marca com ela
+ * a Task que a propria automacao cria, para poder reconhecer e fechar
+ * exatamente essa Task (e nenhuma outra do mesmo agendamento) quando o
+ * agendamento sai de `awaiting_confirmation`. NUNCA vira UI: nenhuma tela
+ * le esta chave para mostrar rotulo, badge ou filtro — quem cria a Task
+ * automatica ja aparece como "Sistema" em `actorNameSnapshot`, o que basta
+ * para a tela. Valor FECHADO (um unico literal aceito), nao texto livre —
+ * cresce por uma nova opcao no union se um dia existir uma segunda origem
+ * automatica. Espelha o CHECK `task_events_created_metadata` do banco.
  */
 export const taskCreatedMetadataSchema = z
-  .object({ assignedTo: taskAssigneeSnapshotSchema.optional() })
+  .object({
+    assignedTo: taskAssigneeSnapshotSchema.optional(),
+    source: z.literal('appointment_confirmation').optional(),
+  })
   .strict()
 
 /**

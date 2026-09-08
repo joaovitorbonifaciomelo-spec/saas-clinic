@@ -288,6 +288,25 @@ describe('metadata de evento', () => {
     ).toBe(false)
   })
 
+  it('created aceita source=appointment_confirmation (identidade tecnica de Confirmacoes)', () => {
+    const r = parseTaskEventMetadata('created', { source: 'appointment_confirmation' })
+    expect(r.ok).toBe(true)
+    expect(r.ok && r.metadata).toEqual({ source: 'appointment_confirmation' })
+  })
+
+  it('created aceita source junto com assignedTo — os dois nao sao mutuamente exclusivos', () => {
+    const r = parseTaskEventMetadata('created', {
+      source: 'appointment_confirmation',
+      assignedTo: { userId: UUID, displayName: 'Ana' },
+    })
+    expect(r.ok).toBe(true)
+  })
+
+  it('created rejeita qualquer valor de source alem do unico literal aceito', () => {
+    expect(parseTaskEventMetadata('created', { source: 'outra_coisa' }).ok).toBe(false)
+    expect(parseTaskEventMetadata('created', { source: '' }).ok).toBe(false)
+  })
+
   it('reopened nao carrega from_status: o evento anterior no log ja diz', () => {
     expect(parseTaskEventMetadata('reopened', { from_status: 'completed' }).ok).toBe(false)
   })
