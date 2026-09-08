@@ -1,20 +1,23 @@
 # Proposta técnica — Confirmação de Agendamento v0.1
 
-> **Status: decisões de produto fechadas. Arquitetura resolvida. Nada
-> implementado.** Nenhuma migration, SQL, endpoint, componente ou teste foi
-> escrito — este documento descreve o que será escrito quando a
-> implementação for autorizada.
+> **Status: decisões de produto fechadas. Arquitetura resolvida, incluindo
+> identidade técnica e fechamento automático da Task. Nada implementado.**
+> Nenhuma migration, SQL, endpoint, componente ou teste foi escrito — este
+> documento descreve o que será escrito quando a implementação for
+> autorizada.
 >
 > Escrita depois de ler `appointment.ts`, `conversation.ts`, `task.ts`, o
 > serviço e controller de `apps/api/src/appointments`, as migrations de
-> Atendimento e de Pendências (incluindo o corpo real de `task_create` e de
-> `is_clinic_member`), e `docs/architecture.md` §6.1 (modo manual).
+> Atendimento e de Pendências (incluindo o corpo real de `task_create`,
+> `is_clinic_member`, `stamp_task_event_actor`, `bump_task_version`,
+> `task_complete` e `enforce_appointment_status_transition`), e
+> `docs/architecture.md` §6.1 (modo manual).
 >
-> Todas as decisões de produto da rodada anterior foram fechadas por você e
-> estão incorporadas ao texto (seção 4). As cinco questões técnicas em
-> aberto (quem cria a Task sem sessão, como representar o ator Sistema,
-> atomicidade/duplicidade, disponibilidade do `pg_cron`, migrations) estão
-> resolvidas nas seções 5–9.
+> Rodada anterior fechou as decisões de produto e a arquitetura de disparo
+> (seções 4–6). Esta rodada fecha o **fechamento** do ciclo: identidade
+> técnica da Task automática (seção 7), fechamento automático quando o
+> agendamento sai de `awaiting_confirmation` (seção 8), e a reavaliação de
+> atomicidade cobrindo os dois lados — abertura e fechamento (seção 9).
 
 ---
 
@@ -49,10 +52,14 @@ nada quando esse dia chegar.
 3. **O disparo já tem para onde apontar sem inventar estado novo:** a
    transição de status **é** o registro de que a confirmação foi pedida, e a
    fila "Atrasadas" de Pendências **é** o alarme de "não respondeu".
+4. **O fechamento também não precisa de estado novo** (achado desta
+   rodada): a MESMA transição de status que tira o agendamento de
+   `awaiting_confirmation` é o gatilho natural para fechar a Task
+   automática — ver seção 8.
 
 A consequência prática, confirmada nesta rodada: **a v0.1 não precisa de
 tabela nova, nem de coluna nova em `appointments` ou `tasks`.** Precisa de
-duas migrations pequenas e aditivas — seção 9.
+três migrations pequenas e aditivas — seção 11.
 
 ---
 
@@ -62,9 +69,9 @@ duas migrations pequenas e aditivas — seção 9.
 |---|---|---|
 | `scheduled` | **Sim — gatilho de entrada** | Único estado de onde a automação parte. |
 | `awaiting_confirmation` | **Sim — resultado do disparo** | Marca "confirmação pedida, esperando resposta". |
-| `confirmed` | **Sim — desfecho** | Fecha o ciclo com sucesso. |
-| `reschedule_requested` | **Sim — desfecho** | Fecha o ciclo pedindo remarcação. |
-| `cancelled` | **Sim — desfecho / interrupção** | Fecha o ciclo (cancelado antes ou depois do pedido). |
+| `confirmed` | **Sim — desfecho, fecha a Task** | Fecha o ciclo com sucesso. |
+| `reschedule_requested` | **Sim — desfecho, fecha a Task** | Fecha o ciclo pedindo remarcação. |
+| `cancelled` | **Sim — desfecho, fecha a Task** | Fecha o ciclo (cancelado antes ou depois do pedido). |
 | `completed`, `no_show` | Não | Só acontecem depois da consulta; a automação já não tem o que fazer. |
 
 Nenhum status novo. A tabela de transições já em produção
@@ -80,19 +87,16 @@ exatamente este caminho.
 | Antecedência do disparo | **24h** antes de `starts_at` |
 | Frequência da varredura | **a cada 15 minutos** |
 | Condição de elegibilidade | `status = 'scheduled' AND starts_at > now() AND starts_at <= now() + interval '24 hours'` |
-| Execuções perdidas | **Janela larga, reavaliada a cada tick — sem mecanismo de retry separado** (ver seção 6) |
+| Execuções perdidas | **Janela larga, reavaliada a cada tick — sem mecanismo de retry separado** (seção 9) |
 | Transição ao disparar | `scheduled → awaiting_confirmation`, **automática** |
 | Pendência criada, na mesma transação | Título `"Confirmar consulta de {Paciente}"`; `dueAt = starts_at - 24h`; `patientId` + `appointmentId` preenchidos; sem responsável (fila geral) |
 | Resposta do paciente | **Sempre manual** nesta versão — recepção usa o `StatusPanel` já existente |
-| Agendamento cancelado com Pendência aberta | **Sem cascata** — a Pendência permanece aberta; a recepção cancela/conclui manualmente |
-| Marcador "criada automaticamente" | **Não existe** — nenhuma chave nova em `metadata`. O ator "Sistema" é resolvido de outro jeito (seção 6), sem tocar no JSON |
-| Escopo inicial | **Opt-in só da clínica piloto** — nenhuma tabela/coluna de configuração; o `clinic_id` é parâmetro fixo passado ao agendar o job, não um dado consultado em runtime |
-| Mudança de banco | **Nenhuma tabela nova. Nenhuma coluna nova** — confirmado na análise (seção 9) |
-
-Isso fecha o que era D1, D3, D4 (parte), D5, D6, D7, D8 e a parte de escopo
-da D2 na rodada anterior. O que restava sem resposta técnica concreta —
-"quem chama, sem sessão, sem usuário fake, sem `service_role`" — é o
-assunto das seções 5–8.
+| Identidade técnica da Task automática | **`created.metadata.source = "appointment_confirmation"`**, opcional, **nunca vira badge/UI** — ver seção 7 *(refina a rodada anterior, que não prevía nenhuma marca)* |
+| Agendamento sai de `awaiting_confirmation` (`confirmed`/`reschedule_requested`/`cancelled`) | **Fecha (conclui) automaticamente** a Task `open` deste agendamento cuja `source` seja `appointment_confirmation` — só ela; outras Tasks do mesmo agendamento não são tocadas — ver seção 8 *(substitui "sem cascata" da rodada anterior)* |
+| Reagendado de volta para `scheduled` | Se `starts_at` voltar a entrar na janela de 24h, o scan **pode gerar uma nova Task** — o ciclo não fica bloqueado pela Task antiga, que já foi fechada — ver seção 8 |
+| Ator "Sistema" | Mantido via variável de sessão (GUC) — mecanismo **interno**, nunca exposto a `authenticated`/`anon` — ver seção 6 |
+| Escopo inicial | **Opt-in só da clínica piloto** — nenhuma tabela/coluna de configuração; o `clinic_id` é parâmetro fixo passado ao agendar o job |
+| Mudança de banco | **Nenhuma tabela nova. Nenhuma coluna nova** — confirmado na análise (seção 11) |
 
 ---
 
@@ -179,8 +183,13 @@ begin
          null)
       returning id into v_task_id;
 
+      -- 'source' e a identidade tecnica da Task — ver secao 7. E a UNICA
+      -- chave alem de assignedTo que o CHECK do banco passara a aceitar.
       insert into public.task_events (clinic_id, task_id, event_type, metadata)
-      values (v_appt.clinic_id, v_task_id, 'created', '{}'::jsonb);
+      values (
+        v_appt.clinic_id, v_task_id, 'created',
+        jsonb_build_object('source', 'appointment_confirmation')
+      );
 
     exception when others then
       -- Bloco BEGIN/EXCEPTION cria savepoint implicito: falha aqui desfaz
@@ -206,16 +215,15 @@ cumpre sem coluna de configuração nova.
 
 ## 6. Como `task_events` representa o ator "Sistema"
 
-Sem marcador em `metadata` (decisão fechada). A resolução usa uma coluna que
-**já existe e já é texto livre**: `task_events.actor_name_snapshot` — a
-mesma coluna que hoje guarda o nome de um usuário que já saiu da clínica.
-`actor_role_snapshot` é tipado como o enum `clinic_role`
-(`admin`/`attendant`/`professional`) e **não** pode virar `'sistema'` sem
-alterar esse enum — não vale a pena para v0.1, então fica `null`, exatamente
-como já fica quando o ator não é resolvível hoje.
+A resolução usa uma coluna que **já existe e já é texto livre**:
+`task_events.actor_name_snapshot` — a mesma coluna que hoje guarda o nome
+de um usuário que já saiu da clínica. `actor_role_snapshot` é tipado como
+o enum `clinic_role` (`admin`/`attendant`/`professional`) e **não** pode
+virar `'sistema'` sem alterar esse enum — não vale a pena para v0.1, então
+fica `null`, exatamente como já fica quando o ator não é resolvível hoje.
 
 O trigger `stamp_task_event_actor()` (`20260828101200_task_events.sql:207`)
-precisa de um ajuste pequeno e aditivo — hoje ele zera o nome sempre que
+recebe um ajuste pequeno e aditivo — hoje ele zera o nome sempre que
 `auth.uid()` é nulo; passa a checar antes um valor de sessão opcional:
 
 ```sql
@@ -231,9 +239,9 @@ declare
 begin
   if auth.uid() is null then
     new.actor_user_id       := null;
-    -- Novo: se algo setou app.system_actor_name NESTA transacao, usa —
-    -- senao, mesmo comportamento de sempre (null). missing_ok=true evita
-    -- erro quando a config nunca foi setada (todo o resto do sistema).
+    -- Se algo setou app.system_actor_name NESTA transacao, usa — senao,
+    -- mesmo comportamento de sempre (null). missing_ok=true evita erro
+    -- quando a config nunca foi setada (todo o resto do sistema).
     new.actor_name_snapshot := nullif(current_setting('app.system_actor_name', true), '');
     new.actor_role_snapshot := null;
     return new;
@@ -256,8 +264,19 @@ início (o `true` final = escopo da **transação atual**, some sozinho ao
 fim — nunca vaza para outra sessão ou outro caller). O resultado: a tela
 mostra **"Sistema criou a pendência."** em vez de "Alguém criou a
 pendência.", sem nenhuma chave nova em JSON, sem alterar o enum de papéis,
-sem tocar em `frase()` no frontend — `actorNameSnapshot` já é o campo que
-essa função lê hoje.
+sem tocar em `frase()` no frontend.
+
+**Por que este mecanismo é seguro e continua v0.1, não motor genérico:**
+`set_config('app.system_actor_name', …, true)` só existe **dentro da
+função que a chamou**, nunca é lido de fora, e nenhum papel externo
+(`authenticated`, `anon`, ou a própria API) tem como setá-lo — não há rota,
+não há RPC, não há parâmetro de entrada que aceite esse valor do cliente.
+Só o código-fonte de `request_appointment_confirmation_scan`, que por sua
+vez só é chamável pelo dono do banco (seção 5), pode produzir o nome
+"Sistema" num evento. Um `authenticated` mal-intencionado não tem caminho
+para forjar um evento de sistema — o único jeito de `auth.uid()` ser nulo
+numa chamada de API é não estar autenticado, e sem chamar a função nova (que
+não é exposta) o `current_setting` nunca é setado.
 
 Todo caminho que **não** passa por `request_appointment_confirmation_scan`
 continua se comportando exatamente como antes: a variável de sessão nunca é
@@ -266,86 +285,300 @@ idêntico ao de hoje.
 
 ---
 
-## 7. Atomicidade e duplicação quando o cron roda 2×
+## 7. Identidade técnica da Task automática
 
-Três camadas, cada uma cobrindo o que a anterior deixaria passar:
+`created.metadata.source = "appointment_confirmation"` — chave opcional,
+só presente quando a Task nasce da varredura. Toda Task criada pelos
+quatro caminhos já existentes (Atendimento, Paciente, Agendamento,
+`/pendencias`) continua **sem** essa chave, porque nenhum deles a envia —
+nenhuma mudança de comportamento para eles.
 
-1. **`FOR UPDATE SKIP LOCKED` na varredura.** Se duas execuções do scan
-   coincidirem (a de 15 min anterior ainda rodando quando a próxima
-   dispara — `pg_cron` não impede isso sozinho), a segunda **pula** as
-   linhas que a primeira já travou, em vez de esperar ou duplicar.
-2. **Reafirmação da condição no `UPDATE`.** `where id = v_appt.id and
-   status = 'scheduled'` — mesmo que duas execuções tenham lido a mesma
-   linha como elegível antes de qualquer lock (janela teórica), só a
-   primeira `UPDATE` a encontrar `status = 'scheduled'`; a segunda recebe
-   `not found` e o `continue` pula para o próximo agendamento sem criar
-   Pendência duplicada.
-3. **A transição de status é a trava de fundo, entre execuções não
-   sobrepostas.** Depois do disparo, o agendamento não está mais
-   `scheduled` — a próxima varredura (15 min depois) nem sequer o
-   seleciona. Um agendamento remarcado (`reschedule_requested → scheduled`)
-   volta a ser elegível de propósito: nova data, novo ciclo de confirmação.
+**Isso não vira badge nem qualquer elemento de UI** (decisão fechada): é
+identidade técnica, para o próprio banco reconhecer "esta Task pertence à
+automação de confirmação" quando precisar fechá-la (seção 8) ou, no
+futuro, quando alguém precisar auditar ou desligar a automação. A tela
+continua mostrando exatamente o que mostra hoje — só o ator muda para
+"Sistema" (seção 6), o que já é visível por si só sem precisar de metadata.
 
-**Atomicidade por agendamento:** o bloco `begin...exception...end` dentro do
-loop cria um savepoint implícito por iteração — se `insert into tasks` ou
-`task_events` falhar depois do `UPDATE` já ter rodado, **só aquele
-agendamento** desfaz (volta a `scheduled`, sem Pendência); os agendamentos
-processados antes dele na mesma varredura continuam confirmados e com
-Pendência, e os agendamentos seguintes do loop continuam sendo
-processados.
+### Mudança mínima em CHECK e Zod
 
-**Execuções perdidas** (cron não rodou, ou a função inteira falhou):
-nenhum mecanismo de retry separado é necessário. A janela de elegibilidade é
-**larga** (24h, reavaliada a cada 15 min) e a condição é sobre **estado**
-(`status = 'scheduled'`), não sobre "aconteceu num intervalo de tempo
-específico". Um agendamento que deveria ter sido pego às 10h e não foi
-continua `scheduled` e dentro da janela às 10h15, 10h30 etc. — a próxima
-execução que rodar o pega, sem qualquer lógica de "recuperar o que perdi".
-Isso é exatamente por que a decisão fechada foi "janela larga, não
-estreita" (seção 4): uma janela estreita (ex.: "entre 24h e 23h45 antes")
-perderia definitivamente um agendamento se um único tick falhasse.
+O CHECK `task_events_created_metadata`
+(`20260828101200_task_events.sql:110`) hoje só aceita a chave `assignedTo`
+em `created.metadata` — qualquer outra chave, incluindo `source`, seria
+**rejeitada pelo banco** sem este ajuste:
+
+```sql
+-- ANTES
+constraint task_events_created_metadata check (
+  event_type <> 'created'
+  or (
+    metadata - 'assignedTo' = '{}'::jsonb
+    and (
+      not (metadata ? 'assignedTo')
+      or (
+        (metadata -> 'assignedTo') ? 'userId'
+        and (metadata -> 'assignedTo') - 'userId' - 'displayName' = '{}'::jsonb
+      )
+    )
+  )
+),
+
+-- DEPOIS — aditivo: so acrescenta a chave 'source', com valor fechado
+constraint task_events_created_metadata check (
+  event_type <> 'created'
+  or (
+    metadata - 'assignedTo' - 'source' = '{}'::jsonb
+    and (
+      not (metadata ? 'assignedTo')
+      or (
+        (metadata -> 'assignedTo') ? 'userId'
+        and (metadata -> 'assignedTo') - 'userId' - 'displayName' = '{}'::jsonb
+      )
+    )
+    and (
+      not (metadata ? 'source')
+      or (metadata ->> 'source') = 'appointment_confirmation'
+    )
+  )
+),
+```
+
+`source` é **um valor fechado**, não texto livre — o CHECK só aceita
+exatamente `'appointment_confirmation'`. Se um dia existir uma segunda
+automação, o CHECK cresce por uma migration nova (`in
+('appointment_confirmation', 'outro_valor')`), do mesmo jeito que qualquer
+enum deste projeto cresce — não abre a porta para qualquer string.
+
+Espelho em `packages/shared/src/task.ts`, na mesma função
+`taskCreatedMetadataSchema` que já existe:
+
+```ts
+// ANTES
+export const taskCreatedMetadataSchema = z
+  .object({ assignedTo: taskAssigneeSnapshotSchema.optional() })
+  .strict()
+
+// DEPOIS
+export const taskCreatedMetadataSchema = z
+  .object({
+    assignedTo: taskAssigneeSnapshotSchema.optional(),
+    /** Identidade tecnica, nunca UI. Fechado de proposito — ver CHECK do banco. */
+    source: z.literal('appointment_confirmation').optional(),
+  })
+  .strict()
+```
+
+Nenhuma outra função, tela ou teste que já existe precisa mudar: `source`
+é opcional em ambas as camadas, e `TaskEventView.metadata` já é `Record<string, unknown>`
+— continua aceitando a chave nova sem tocar em tipos de leitura.
 
 ---
 
-## 8. `pg_cron` no Supabase Dev — verificado, não habilitado
+## 8. Fechamento automático da Task ao sair de `awaiting_confirmation`
 
-Consulta direta (`pg_available_extensions`, `pg_extension`) contra o projeto
-Dev, só leitura, nada alterado:
+**Onde fechar: um trigger em `appointments`, não a API, não um job
+separado.** A mudança de status já acontece por um caminho só —
+`appointments.service.ts#changeStatus`, um `UPDATE` simples sob RLS,
+chamado pelo `StatusPanel` — mas amarrar o fechamento da Task a **esse
+serviço específico** significa que qualquer caminho futuro que também
+mude o status (um webhook do WhatsApp, por exemplo) teria que lembrar de
+repetir a mesma lógica. Um trigger `AFTER UPDATE OF status` dispara
+**não importa quem** mudou o status, hoje ou no futuro — mesmo raciocínio
+que já rege `enforce_appointment_status_transition`, `bump_task_version` e
+todo o resto do banco deste projeto.
+
+```sql
+create or replace function public.close_appointment_confirmation_task()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_task_id uuid;
+begin
+  if not (
+    old.status = 'awaiting_confirmation'
+    and new.status in ('confirmed', 'reschedule_requested', 'cancelled')
+  ) then
+    return new;
+  end if;
+
+  -- So a Task ABERTA cuja origem e ESTA automacao. Uma Task manual do
+  -- mesmo agendamento (criada pelo botao "Criar pendencia") nao tem
+  -- source = 'appointment_confirmation' e fica intocada.
+  select t.id into v_task_id
+    from public.tasks t
+    join public.task_events e
+      on e.task_id = t.id and e.event_type = 'created'
+   where t.appointment_id = new.id
+     and t.status = 'open'
+     and (e.metadata ->> 'source') = 'appointment_confirmation';
+
+  if v_task_id is null then
+    return new;  -- nada da automacao aberto para este agendamento
+  end if;
+
+  -- Mesma forma de UPDATE que task_complete usa — bump_task_version() e
+  -- enforce_task_status_transition() ja disparam sozinhos, automaticamente,
+  -- por serem triggers em tasks. So NAO ha expectedVersion aqui: isto e uma
+  -- cascata interna, nao um pedido de cliente com uma versao vista na tela.
+  update public.tasks
+     set status = 'completed',
+         completed_at = now(),
+         completed_by = auth.uid()
+   where id = v_task_id
+     and status = 'open';
+
+  if found then
+    insert into public.task_events (clinic_id, task_id, event_type)
+    values (new.clinic_id, v_task_id, 'completed');
+  end if;
+  -- 'not found' aqui so aconteceria se a Task foi concluida/cancelada por
+  -- OUTRA transacao no intervalo entre o select e o update — no-op seguro,
+  -- sem erro: o mundo ja esta como o gatilho queria deixar.
+
+  return new;
+end;
+$$;
+
+drop trigger if exists appointments_close_confirmation_task on public.appointments;
+create trigger appointments_close_confirmation_task
+  after update of status on public.appointments
+  for each row execute function public.close_appointment_confirmation_task();
+```
+
+**Por que `SECURITY DEFINER` aqui não é sobre `auth.uid()` — é sobre
+grants.** Diferente da função de varredura (seção 5), este trigger roda
+**dentro da sessão real** de quem mudou o status do agendamento — a
+recepcionista, autenticada, com `auth.uid()` preenchido normalmente. O
+motivo de precisar `SECURITY DEFINER` é outro: `tasks`/`task_events` não
+têm `UPDATE`/`INSERT` liberado para `authenticated` (é RPC-only, de
+propósito — mesma razão pela qual `task_create` existe em vez de um
+`INSERT` direto). Sem `SECURITY DEFINER`, o trigger tentaria escrever com
+os privilégios da recepcionista e falharia por falta de grant.
+
+**Consequência boa, não pedida mas correta:** como o trigger roda com
+`auth.uid()` da recepcionista de verdade, o evento `completed` da Task é
+carimbado com ela como atora — "Maria concluiu a pendência.", não
+"Sistema concluiu a pendência.". Faz sentido: foi a ação real dela
+(confirmar o agendamento) que causou o fechamento. O GUC do ator "Sistema"
+(seção 6) só é necessário no lado da **criação**, onde de fato não há
+sessão nenhuma.
+
+### Ponto 3 — reagendar de volta para `scheduled`
+
+Já coberto pela combinação dos dois mecanismos, sem nenhum código a mais:
+
+1. Agendamento em `awaiting_confirmation` recebe `reschedule_requested` →
+   o trigger acima fecha a Task automática (`completed`).
+2. Recepção reagenda: atualiza `starts_at`/`ends_at` e transiciona
+   `reschedule_requested → scheduled` (já permitido hoje).
+3. Não há mais Task `open` com `appointment_id` = este e `source =
+   'appointment_confirmation'` — foi fechada no passo 1.
+4. Quando o novo `starts_at` entrar na janela de 24h, a próxima varredura
+   (seção 5) trata o agendamento como elegível de novo — `status =
+   'scheduled'` bate, e a cláusula `not exists (... status = 'open' ...)`
+   não encontra mais a Task antiga (ela virou `completed`). Uma Task nova
+   nasce para o novo horário.
+
+---
+
+## 9. Atomicidade — reavaliada para os dois lados
+
+**Abertura (seção 5):** dentro do `for` da varredura, cada iteração roda
+num bloco `begin...exception...end`, que cria um **savepoint implícito**.
+Update do agendamento e insert da Task+evento acontecem em sequência
+dentro do mesmo savepoint — se o insert falhar, o savepoint inteiro
+desfaz, **incluindo** a transição de status que já tinha rodado; o
+agendamento volta a `scheduled` como se nada tivesse acontecido. Nenhum
+outro agendamento da mesma varredura é afetado, e a varredura inteira não
+aborta por causa de um caso.
+
+**Fechamento (seção 8):** aqui a atomicidade é **de graça**, garantida
+pelo próprio Postgres — o trigger roda como parte da MESMA transação que
+já está fazendo o `UPDATE` do agendamento (é assim que todo trigger
+`AFTER` funciona: mesma transação da instrução que disparou). Não há
+`BEGIN/EXCEPTION` no trigger de fechamento de propósito: se algo dentro
+dele falhar de verdade (erro inesperado, não o caso esperado de "já
+fechada"), a exceção deve **propagar e abortar a transação inteira** —
+o agendamento **não pode** virar `confirmed` se a Task correspondente não
+puder ser fechada, porque isso deixaria os dois lados dessincronizados (o
+tipo exato de "estado intermediário inconsistente" que a rodada pediu para
+evitar). O caso esperado e não-excepcional — Task já fechada por outra via
+— nunca lança exceção: é um `update ... where status = 'open'` comum, que
+silenciosamente afeta zero linhas (`if found` cobre isso, sem
+`exception`).
+
+**Duplicação entre execuções concorrentes da varredura**, sem mudança em
+relação à rodada anterior — três camadas:
+
+1. `FOR UPDATE SKIP LOCKED` na seleção: uma segunda execução sobreposta
+   pula as linhas que a primeira já travou.
+2. Reafirmação da condição no `UPDATE` do agendamento
+   (`where ... and status = 'scheduled'`): se duas execuções liam a mesma
+   linha como elegível antes de qualquer lock, só a primeira `UPDATE` a
+   encontra; a segunda recebe `not found` e pula.
+3. A transição de status é a trava de fundo entre execuções não
+   sobrepostas: depois do disparo, `status <> 'scheduled'`, e a próxima
+   varredura nem seleciona a linha.
+
+**Execuções perdidas:** nenhum mecanismo de retry separado. A janela é
+larga (24h, reavaliada a cada 15 min) e a condição é sobre **estado**
+(`status = 'scheduled'`), não sobre "aconteceu num intervalo específico" —
+um agendamento que deveria ter sido pego e não foi continua elegível no
+próximo tick, sem lógica de recuperação dedicada.
+
+---
+
+## 10. `pg_cron` no Supabase Dev — verificado, não habilitado
+
+Consulta direta (`pg_available_extensions`, `pg_extension`) contra o
+projeto Dev, só leitura, nada alterado:
 
 | Pergunta | Resposta |
 |---|---|
 | Está disponível para instalar? | **Sim** — `pg_cron` versão `1.6.4` aparece em `pg_available_extensions`. |
 | Já está instalada/habilitada? | **Não** — ausente de `pg_extension`; `installed_version` é `null`. |
 
-Ou seja: nenhum bloqueio de infraestrutura para a Opção A (`pg_cron` +
-função `SECURITY DEFINER`). Habilitar a extensão e agendar o job é passo de
+Nenhum bloqueio de infraestrutura para a Opção A (`pg_cron` + funções
+`SECURITY DEFINER`). Habilitar a extensão e agendar o job é passo de
 **implementação**, fora desta rodada — normalmente via o painel do Supabase
 (Database → Extensions) ou `create extension pg_cron;` com privilégio
 adequado, a confirmar no momento de implementar.
 
 ---
 
-## 9. Migrations necessárias
+## 11. Migrations necessárias
 
-**Confirmado: nenhuma tabela nova, nenhuma coluna nova.** Duas migrations,
-as duas aditivas (nenhuma altera comportamento de código já em produção):
+**Confirmado: nenhuma tabela nova, nenhuma coluna nova.** Três migrations,
+todas aditivas (nenhuma altera comportamento de código já em produção):
 
 1. **Nova função `request_appointment_confirmation_scan(p_clinic_id uuid)`**
    (seção 5) — `SECURITY DEFINER`, `revoke execute` de `public`/`anon`/
-   `authenticated` explícito (só chamável pelo `pg_cron`/dono do banco).
+   `authenticated` explícito.
 2. **Ajuste em `stamp_task_event_actor()`** (seção 6) — troca `null` fixo
    por `nullif(current_setting('app.system_actor_name', true), '')` no
-   ramo `auth.uid() is null`. Aditivo e retrocompatível: sem a variável de
-   sessão setada, o comportamento é idêntico ao de hoje.
+   ramo `auth.uid() is null`. Aditivo e retrocompatível.
+3. **Ajuste em `task_events_created_metadata` + nova função
+   `close_appointment_confirmation_task()` e seu trigger** (seções 7 e 8)
+   — o CHECK ganha a cláusula opcional de `source`, e o novo trigger é
+   `SECURITY DEFINER` com grants padrão de trigger (não é RPC, não recebe
+   `revoke` explícito — triggers não são chamados por role, são disparados
+   pelo evento).
+
+E, fora do banco, um espelho pequeno em `packages/shared/src/task.ts`
+(`taskCreatedMetadataSchema` ganha `source`, seção 7) — mesmo arquivo, sem
+migration própria.
 
 Fora das migrations: agendar o job em si
 (`select cron.schedule(...)`) — depende da extensão estar habilitada
-(seção 8) e do `clinic_id` real da clínica piloto, então é passo de
+(seção 10) e do `clinic_id` real da clínica piloto, então é passo de
 implementação/operação, não de schema.
 
 ---
 
-## 10. Como isso cria Pendências sem acoplar os módulos
+## 12. Como isso cria Pendências sem acoplar os módulos
 
 O mesmo padrão dos quatro pontos de entrada existentes (Atendimento,
 Paciente, Agendamento) — só que em vez de chamar `task_create` (barrada
@@ -362,31 +595,37 @@ Confirmações  ──▶  insert em tasks(appointment_id, patient_id, …)  ─
 A automação não importa nada de `apps/web/.../pendencias`, não conhece
 `.pd-*`, não sabe que existe um Dashboard. Pendências continua sendo o
 único módulo que sabe o que é uma Pendência; Confirmações só sabe que
-precisa gravar uma linha com os IDs certos.
+precisa gravar uma linha com os IDs certos — e, agora, fechá-la quando o
+agendamento sai de `awaiting_confirmation`, o que também não exige
+conhecer nada de `/pendencias`: é uma linha em `tasks`/`task_events`, as
+mesmas tabelas.
 
 ---
 
-## 11. Os quatro desfechos
+## 13. Os quatro desfechos
 
-| Desfecho | O que acontece | Pendência |
+| Desfecho | O que acontece com o agendamento | Pendência |
 |---|---|---|
-| **Confirmado** | Recepção fala com o paciente, marca `awaiting_confirmation → confirmed` no `StatusPanel`. | Conclui manualmente — a automação não pode adivinhar que a conversa aconteceu fora da tela. |
-| **Pediu reagendamento** | `awaiting_confirmation → reschedule_requested`. | Idem: conclui ou cancela manualmente; o fluxo de remarcação já existente assume dali. |
-| **Não respondeu** | Nada muda de status. | Fica aberta e **vence** — cai em "Atrasadas" no Dashboard e em `/pendencias`. Nenhum estado novo, nenhum job de "verificar não-resposta": é o próprio prazo vencido. |
-| **Cancelado** | Em qualquer momento, `→ cancelled`. | **Sem cascata** (decisão fechada) — a Pendência permanece aberta até a recepção agir. |
+| **Confirmado** | Recepção fala com o paciente, marca `awaiting_confirmation → confirmed` no `StatusPanel`. | **Fecha automaticamente** (trigger, seção 8) — ator do evento `completed` é a própria recepcionista. |
+| **Pediu reagendamento** | `awaiting_confirmation → reschedule_requested`. | **Fecha automaticamente**, mesmo trigger. O fluxo de remarcação já existente assume dali; se voltar a `scheduled` dentro da janela, nova Task nasce (seção 8, ponto 3). |
+| **Não respondeu** | Nada muda de status. | Fica aberta e **vence** — cai em "Atrasadas" no Dashboard e em `/pendencias`. Nenhum estado novo: é o próprio prazo vencido. O trigger de fechamento não dispara porque o status não muda. |
+| **Cancelado** | Em qualquer momento, `→ cancelled`. | **Fecha automaticamente**, mesmo trigger — só se o cancelamento aconteceu a partir de `awaiting_confirmation`. Um agendamento cancelado ainda em `scheduled` (antes de qualquer disparo) não tem Task para fechar. |
 
 ---
 
-## 12. O que já funciona sem WhatsApp real vs. o que depende da Meta Cloud API
+## 14. O que já funciona sem WhatsApp real vs. o que depende da Meta Cloud API
 
 ### Funciona hoje, sem nenhuma integração nova
 
 - Disparo automático (`pg_cron` + função) na janela de 24h, a cada 15 min.
 - Transição `scheduled → awaiting_confirmation`.
-- Criação da Pendência vinculada, com ator "Sistema".
-- Toda a jornada humana: recepção liga, manda mensagem pelo WhatsApp pessoal
-  ou o que já faz hoje, registra o resultado pelo `StatusPanel` — o modo
-  manual do Atendimento já serve para registrar esse contato, se a
+- Criação da Pendência vinculada, com ator "Sistema" e identidade técnica
+  (`source`).
+- Fechamento automático da Pendência quando o agendamento sai de
+  `awaiting_confirmation`, com o ator humano real.
+- Toda a jornada humana: recepção liga, manda mensagem pelo WhatsApp
+  pessoal ou o que já faz hoje, registra o resultado pelo `StatusPanel` —
+  o modo manual do Atendimento já serve para registrar esse contato, se a
   recepção quiser (`POST /conversations/:id/messages`, sem enviar nada).
 - Todo o alarme de "não respondeu" (fila de Pendências vencidas).
 
@@ -399,7 +638,7 @@ precisa gravar uma linha com os IDs certos.
   desenhado para isto, só não foi ligado.
 - **Recebimento automático da resposta do paciente** ("SIM"/"não posso") e
   tradução disso em `confirmed`/`reschedule_requested` sem toque humano —
-  isso é bot/webhook, não Confirmações v0.1 (fora de escopo, seção 13).
+  isso é bot/webhook, não Confirmações v0.1 (fora de escopo, seção 15).
 - **`messages.deliveryStatus`** (`pending/sent/delivered/read/failed`) só
   passa a carregar informação real quando existe canal de verdade; hoje o
   CHECK do banco proíbe qualquer valor ali para mensagens manuais.
@@ -411,12 +650,14 @@ Meta Cloud.**
 
 ---
 
-## 13. Fora do escopo da v0.1 (de propósito)
+## 15. Fora do escopo da v0.1 (de propósito)
 
 Envio real de mensagem; recebimento e interpretação automática da resposta
 do paciente (bot); múltiplas tentativas/lembretes escalonados; motor de
 regras configurável ("se X, então Y"); qualquer automação que não seja
 confirmação de agendamento; tabela de histórico de tentativas; canal
-`whatsapp` de fato criado em `conversations`; cascata automática de
-cancelamento da Pendência; qualquer UI nova — a v0.1 usa Pendências e o
-`StatusPanel` que já existem, sem nenhuma tela nova.
+`whatsapp` de fato criado em `conversations`; badge ou qualquer elemento de
+UI mostrando "criada automaticamente"; fechamento automático de Tasks que
+não tenham `source = 'appointment_confirmation'`; qualquer UI nova — a
+v0.1 usa Pendências e o `StatusPanel` que já existem, sem nenhuma tela
+nova.
