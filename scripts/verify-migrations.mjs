@@ -2035,13 +2035,26 @@ try {
     '23514',
   )
 
-  await afirma('scan abre Task para agendamento elegivel: status, titulo, prazo, contexto, ator', async () => {
+  await afirma('CHECK aceita assignedTo e source juntos (nao sao mutuamente exclusivos no banco)', async () => {
+    const t = (await novaTask(userA, clinicA, { title: 'CHECK combinado' })).task
+    await db.query(
+      `insert into public.task_events (clinic_id, task_id, event_type, metadata)
+       values ($1,$2,'created', jsonb_build_object(
+         'assignedTo', jsonb_build_object('userId', $3::text, 'displayName', 'X'),
+         'source', 'appointment_confirmation'
+       ))`,
+      [clinicA, t.id, userA],
+    )
+    return true
+  })
+
+  await afirma('scan abre Task para agendamento elegivel: status, titulo, prazo, contexto, ator, created_by', async () => {
     const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
     await scan(clinicA)
 
     const { rows: ag } = await db.query('select status from public.appointments where id = $1', [appt.id])
     const { rows: tk } = await db.query(
-      `select id, title, due_at, patient_id, appointment_id, status
+      `select id, title, due_at, patient_id, appointment_id, status, created_by
          from public.tasks where appointment_id = $1`,
       [appt.id],
     )
@@ -2061,6 +2074,7 @@ try {
       new Date(t.due_at).toISOString() === prazoEsperado &&
       t.patient_id === pacienteA &&
       t.status === 'open' &&
+      t.created_by === null &&
       ev.length === 1 &&
       ev[0].actor_user_id === null &&
       ev[0].actor_name_snapshot === 'Sistema' &&
@@ -2106,6 +2120,70 @@ try {
     )
     return rows[0].n === 1
   })
+
+  await afirma(
+    'scan: se a criacao da Task/evento falhar, o appointment daquela iteracao continua scheduled (sem orfao)',
+    async () => {
+      const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+
+      // Trigger temporario para forcar a falha exatamente do evento 'created'
+      // com source de confirmacao, simulando um erro no meio do bloco atomico.
+      await db.exec(`
+        create or replace function public.quebra_evento_confirmacao_tmp() returns trigger
+        language plpgsql as $fn$
+        begin
+          if new.event_type = 'created' and (new.metadata ->> 'source') = 'appointment_confirmation' then
+            raise exception 'FALHA_PROPOSITAL_TESTE_ATOMICIDADE';
+          end if;
+          return new;
+        end;
+        $fn$;
+        create trigger tmp_quebra_confirmacao before insert on public.task_events
+          for each row execute function public.quebra_evento_confirmacao_tmp();
+      `)
+
+      let erroInesperado = null
+      try {
+        await scan(clinicA)
+      } catch (e) {
+        // A funcao de varredura tem EXCEPTION WHEN OTHERS por iteracao: nao
+        // deveria propagar. Se propagar, e uma regressao real.
+        erroInesperado = e
+      }
+
+      await db.exec(`
+        drop trigger if exists tmp_quebra_confirmacao on public.task_events;
+        drop function if exists public.quebra_evento_confirmacao_tmp();
+      `)
+
+      if (erroInesperado) return false
+
+      const { rows: ag } = await db.query('select status from public.appointments where id = $1', [appt.id])
+      const { rows: tk } = await db.query(
+        'select count(*)::int as n from public.tasks where appointment_id = $1',
+        [appt.id],
+      )
+      return ag[0].status === 'scheduled' && tk[0].n === 0
+    },
+  )
+
+  await afirma(
+    'GUC do ator Sistema e transaction-local: operacao humana logo apos o scan usa o ator real',
+    async () => {
+      const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+      await scan(clinicA)
+
+      const tarefaHumana = (
+        await novaTask(userA, clinicA, { title: 'Tarefa humana logo depois do scan' })
+      ).task
+      const { rows } = await db.query(
+        `select actor_user_id, actor_name_snapshot
+           from public.task_events where task_id = $1 and event_type = 'created'`,
+        [tarefaHumana.id],
+      )
+      return rows[0].actor_user_id === userA && rows[0].actor_name_snapshot !== 'Sistema'
+    },
+  )
 
   await afirmaRecusa(
     'request_appointment_confirmation_scan NAO e executavel por authenticated nem anon',
@@ -2183,6 +2261,41 @@ try {
     return automatica.status === 'completed' && manualDepois.status === 'open'
   })
 
+  await afirma('fechamento NAO dispara para awaiting_confirmation -> completed (fora dos 3 estados fechados)', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+    await comoUsuario(userA, () =>
+      db.query("update public.appointments set status = 'completed' where id = $1", [appt.id]),
+    )
+    const { rows } = await db.query('select status from public.tasks where appointment_id = $1', [appt.id])
+    return rows[0].status === 'open'
+  })
+
+  await afirma('fechamento e no-op seguro quando a Task automatica ja foi concluida por outra via', async () => {
+    const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
+    await scan(clinicA)
+    const tarefa = (
+      await db.query('select id, version from public.tasks where appointment_id = $1', [appt.id])
+    ).rows[0]
+
+    // Staff conclui a Task manualmente ANTES de confirmar o agendamento.
+    await chamarT(userA, 'task_complete', [tarefa.id, tarefa.version])
+
+    // O UPDATE do agendamento ainda dispara o trigger, mas nao ha mais Task
+    // 'open' com esse source: precisa ser no-op, sem erro e sem 2o evento.
+    await comoUsuario(userA, () =>
+      db.query("update public.appointments set status = 'confirmed' where id = $1", [appt.id]),
+    )
+
+    const { rows: tk } = await db.query('select status, version from public.tasks where id = $1', [tarefa.id])
+    const { rows: ev } = await db.query(
+      `select count(*)::int as n from public.task_events
+         where task_id = $1 and event_type = 'completed'`,
+      [tarefa.id],
+    )
+    return tk[0].status === 'completed' && tk[0].version === tarefa.version + 1 && ev[0].n === 1
+  })
+
   await afirma('reagendar de volta para scheduled dentro da janela gera Task NOVA', async () => {
     const appt = await novoAgendamentoEm(userA, clinicA, pacienteA, profA, 12)
     await scan(clinicA)
@@ -2219,8 +2332,8 @@ try {
     )
   })
 
-  await afirma('close_appointment_confirmation_task NAO e executavel por authenticated nem anon', async () => {
-    for (const papel of ['authenticated', 'anon']) {
+  await afirma('close_appointment_confirmation_task NAO e executavel por authenticated, anon nem public', async () => {
+    for (const papel of ['authenticated', 'anon', 'public']) {
       const { rows } = await db.query('select has_function_privilege($1, $2, $3) as pode', [
         papel,
         'public.close_appointment_confirmation_task()',
@@ -2229,6 +2342,15 @@ try {
       if (rows[0].pode) return false
     }
     return true
+  })
+
+  await afirma('request_appointment_confirmation_scan NAO e executavel por public (alem de authenticated/anon)', async () => {
+    const { rows } = await db.query('select has_function_privilege($1, $2, $3) as pode', [
+      'public',
+      'public.request_appointment_confirmation_scan(uuid)',
+      'EXECUTE',
+    ])
+    return rows[0].pode === false
   })
 
 } catch (e) {
