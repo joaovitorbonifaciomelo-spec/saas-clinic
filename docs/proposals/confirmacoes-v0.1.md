@@ -661,3 +661,60 @@ UI mostrando "criada automaticamente"; fechamento automático de Tasks que
 não tenham `source = 'appointment_confirmation'`; qualquer UI nova — a
 v0.1 usa Pendências e o `StatusPanel` que já existem, sem nenhuma tela
 nova.
+
+---
+
+## 16. Operação: o agendamento automático (`pg_cron`) no Dev
+
+Habilitado SOMENTE no Supabase Dev (ref `xrhcwtbswzjcvgxyvpel`), como piloto
+de uma única clínica. Não existe migration para isto — de propósito: o
+`clinic_id` da clínica piloto é configuração deste ambiente, não código, e
+**nunca** deve aparecer em um arquivo versionado. A extensão `pg_cron` foi
+ativada e o job criado por uma sessão administrativa direta no banco
+(`SUPABASE_DB_URL` do `.env.test`, que nunca é commitado), não por
+`supabase db push`.
+
+**Onde a configuração vive:** inteiramente dentro do próprio banco do
+projeto Dev, nas tabelas do schema `cron` que a extensão cria
+(`cron.job` guarda nome, schedule e o comando SQL — incluindo o
+`clinic_id` literal — de cada job; `cron.job_run_details` guarda o
+histórico de execuções). Não há arquivo, `.env` ou variável de ambiente da
+aplicação envolvidos.
+
+**Job:** `appointment-confirmation-pilot`, `*/15 * * * *`, chama
+`public.request_appointment_confirmation_scan(<clinic_id da clínica
+piloto>)`. A função continua com `EXECUTE` revogado de
+`public`/`anon`/`authenticated` — o job roda como o dono do `cron`
+(o mesmo papel que aplica migrations), não como um papel de cliente.
+
+**Para inspecionar o estado atual** (conectado ao banco do Dev, papel
+administrativo):
+
+```sql
+select jobid, jobname, schedule, command, active from cron.job;
+select * from cron.job_run_details order by start_time desc limit 20;
+```
+
+**Para desativar sem remover** (mantém o histórico e a definição, só para
+de rodar):
+
+```sql
+select cron.alter_job(job_id := (select jobid from cron.job where jobname = 'appointment-confirmation-pilot'), active := false);
+```
+
+**Para remover completamente:**
+
+```sql
+select cron.unschedule('appointment-confirmation-pilot');
+```
+
+**Para desativar a extensão inteira** (só depois de remover todos os jobs
+que dependem dela):
+
+```sql
+drop extension if exists pg_cron;
+```
+
+Nenhum destes comandos toca em tabela do domínio (`appointments`, `tasks`,
+etc.) — `pg_cron` é infraestrutura do próprio Postgres, isolada do schema
+`public`.
