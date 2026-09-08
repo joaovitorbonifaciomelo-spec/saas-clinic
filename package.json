@@ -29,6 +29,7 @@
     "test:hint": "pnpm build:shared && vitest run --project hint",
     "test:atendimento": "pnpm build:shared && vitest run --project atendimento",
     "test:tasks": "pnpm build:shared && vitest run --project tasks",
+    "test:confirmacoes": "pnpm build:shared && vitest run --project confirmacoes",
     "verify:migrations": "node scripts/verify-migrations.mjs"
   },
   "devDependencies": {

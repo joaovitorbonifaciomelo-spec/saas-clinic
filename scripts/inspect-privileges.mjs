@@ -416,6 +416,10 @@ const INTERNAL_FUNCTIONS = [
   'enforce_task_context_immutable',
   'enforce_task_status_transition',
   'bump_task_version',
+  // Confirmacoes v0.1: varredura (chamada nua pelo dono do banco/pg_cron) e
+  // o trigger de fechamento — nenhuma das duas e RPC de cliente.
+  'request_appointment_confirmation_scan',
+  'close_appointment_confirmation_task',
 ]
 
 console.log('')

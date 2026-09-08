@@ -40,6 +40,7 @@ export default defineConfig({
             // desta secao e `tests/**`, entao todo arquivo novo entra aqui por
             // padrao.
             'tests/tasks-*.test.ts',
+            'tests/confirmacoes-*.test.ts',
             'tests/pendencias-ui.test.ts',
             'tests/dashboard-pendencias.test.ts',
             'tests/pendencia-atalhos.test.ts',
@@ -62,6 +63,24 @@ export default defineConfig({
           root: './supabase',
           environment: 'node',
           include: ['tests/tasks-*.test.ts'],
+          testTimeout: 120_000,
+          hookTimeout: 180_000,
+          fileParallelism: false,
+          env: { NODE_ENV: 'test' },
+          setupFiles: ['./tests/setup-env.ts'],
+        },
+      },
+      {
+        /*
+         * Confirmacoes contra o banco REAL. Depende das quatro migrations de
+         * Confirmacoes aplicadas no Dev, entao fica fora de `pnpm test` e
+         * roda em `pnpm test:confirmacoes`.
+         */
+        test: {
+          name: 'confirmacoes',
+          root: './supabase',
+          environment: 'node',
+          include: ['tests/confirmacoes-*.test.ts'],
           testTimeout: 120_000,
           hookTimeout: 180_000,
           fileParallelism: false,
