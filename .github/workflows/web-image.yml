@@ -1,0 +1,150 @@
+name: Web image
+
+# Somente manual: a imagem carrega os NEXT_PUBLIC_* de Production, que ainda nao
+# existem. Um gatilho por push geraria build quebrado a cada commit.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ vars.PRODUCTION_NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.PRODUCTION_NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      NEXT_PUBLIC_API_URL: ${{ vars.PRODUCTION_NEXT_PUBLIC_API_URL }}
+    steps:
+      - name: Variaveis de Production presentes
+        run: |
+          for v in NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY NEXT_PUBLIC_API_URL; do
+            if [ -z "$(printenv "$v")" ]; then
+              echo "FALHA: PRODUCTION_$v nao configurada no GitHub"
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Sem tag `latest`: o deploy so conhece imagens por SHA.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/saas-clinic-web
+          tags: |
+            type=sha,format=long
+
+      # Build local primeiro: o smoke test roda ANTES de qualquer push para o
+      # registro, entao uma imagem quebrada nunca chega a ficar disponivel.
+      - name: Build (sem push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/web.Dockerfile
+          push: false
+          load: true
+          tags: clinic-saas-web:smoke
+          build-args: |
+            NEXT_PUBLIC_SUPABASE_URL=${{ env.NEXT_PUBLIC_SUPABASE_URL }}
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ env.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+            NEXT_PUBLIC_API_URL=${{ env.NEXT_PUBLIC_API_URL }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      # ---------------------------------------------------------------------
+      # SMOKE TEST
+      # ---------------------------------------------------------------------
+      - name: Smoke - processo nao roda como root
+        run: |
+          UID_RUN=$(docker run --rm --entrypoint id clinic-saas-web:smoke -u)
+          echo "uid=$UID_RUN"
+          if [ "$UID_RUN" = "0" ]; then
+            echo "FALHA: container roda como root"
+            exit 1
+          fi
+
+      - name: Smoke - nenhum .env dentro da imagem
+        run: |
+          FOUND=$(docker run --rm --entrypoint find clinic-saas-web:smoke \
+            /app -xdev \( -name '.env' -o -name '.env.*' \) -not -name '*.example' 2>/dev/null || true)
+          if [ -n "$FOUND" ]; then
+            echo "FALHA: arquivos de ambiente na imagem:"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "OK: nenhum .env na imagem"
+
+      - name: Smoke - nenhum segredo no codigo do frontend
+        run: |
+          HITS=$(docker run --rm --entrypoint grep clinic-saas-web:smoke \
+            -rIlE 'SUPABASE_SERVICE_ROLE_KEY|SUPABASE_DB_URL|postgresql://postgres:' \
+            /app/apps /app/packages 2>/dev/null || true)
+          if [ -n "$HITS" ]; then
+            echo "FALHA: possivel segredo embutido:"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "OK: nenhum marcador de segredo"
+
+      - name: Smoke - container sobe e serve pagina, assets e public
+        run: |
+          # `/` e publica e nao consulta o Supabase: nao precisa de rede externa.
+          docker run -d --name smoke -p 127.0.0.1:3000:3000 clinic-saas-web:smoke
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/ -o /tmp/home.html 2>/dev/null; then
+              break
+            fi
+            sleep 2
+            if [ "$i" = "30" ]; then
+              echo "FALHA: / nao respondeu"
+              docker logs smoke
+              exit 1
+            fi
+          done
+
+          # .next/static e public sao copiados a mao no Dockerfile: se faltarem, a
+          # pagina responde 200 e abre sem CSS nem imagens.
+          ASSET=$(grep -oE '/_next/static/[^"]+\.(js|css)' /tmp/home.html | head -1)
+          [ -n "$ASSET" ] || { echo "FALHA: nenhum asset no HTML"; exit 1; }
+          curl -fsS -o /dev/null "http://127.0.0.1:3000$ASSET"
+          curl -fsS -o /dev/null http://127.0.0.1:3000/produto-agenda.webp
+          echo "OK: pagina, $ASSET e public respondem"
+
+          docker image inspect clinic-saas-web:smoke --format '{{.Size}}' \
+            | awk '{printf "  %.1f MB\n", $1/1024/1024}'
+          docker rm -f smoke
+
+      # ---------------------------------------------------------------------
+      # Push somente apos o smoke test passar
+      # ---------------------------------------------------------------------
+      - name: Push para o GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/web.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            NEXT_PUBLIC_SUPABASE_URL=${{ env.NEXT_PUBLIC_SUPABASE_URL }}
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ env.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+            NEXT_PUBLIC_API_URL=${{ env.NEXT_PUBLIC_API_URL }}
+          cache-from: type=gha,scope=web
+
+      - name: Tag de deploy
+        run: |
+          echo "## Imagem publicada" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "WEB_IMAGE=${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Use em /opt/clinic-saas-production/.env na VPS." >> $GITHUB_STEP_SUMMARY
