@@ -16,7 +16,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "pnpm build:shared && pnpm -r typecheck && tsc -p supabase/tsconfig.json",
-    "test": "pnpm build:shared && vitest run --project shared --project api",
+    "test": "pnpm build:shared && vitest run --project shared --project api --project web",
     "test:isolation": "pnpm build:shared && vitest run --project isolation",
     "test:isolation:cleanup": "node scripts/cleanup-test-run.mjs",
     "test:runs:sweep": "node scripts/sweep-run-manifests.mjs",

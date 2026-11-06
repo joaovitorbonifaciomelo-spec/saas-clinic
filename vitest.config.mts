@@ -20,6 +20,17 @@ export default defineConfig({
         },
       },
       {
+        // Componentes do frontend, em jsdom. Sem rede e sem banco.
+        test: {
+          name: 'web',
+          root: './apps/web',
+          environment: 'jsdom',
+          include: ['src/**/*.test.tsx'],
+        },
+        // O tsconfig do Next usa jsx: preserve, que o Vite herdaria.
+        oxc: { jsx: { runtime: 'automatic' } },
+      },
+      {
         // Depende de banco remoto: fora do `pnpm test`, roda em `pnpm test:isolation`.
         test: {
           name: 'isolation',

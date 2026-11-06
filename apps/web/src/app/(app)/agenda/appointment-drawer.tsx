@@ -1,6 +1,6 @@
 'use client'
 
-import { useActionState, useEffect, useState } from 'react'
+import { startTransition, useActionState, useEffect, useState, type FormEvent } from 'react'
 import {
   APPOINTMENT_STATUS_LABELS,
   APPOINTMENT_STATUS_TRANSITIONS,
@@ -16,7 +16,8 @@ import {
   saveAppointmentAction,
   type AgendaActionState,
 } from './agenda-actions'
-import { instantFromLocal, localDateKey, localTimeLabel } from './agenda-time'
+import { draftToFormData, type AppointmentDraft } from './appointment-draft'
+import { localDateKey, localTimeLabel } from './agenda-time'
 import { NovaPendencia } from '../pendencias/nova-pendencia'
 import { IconPlus } from '../../ui/icons'
 
@@ -50,18 +51,23 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
   const action = saveAppointmentAction.bind(null, editing?.id ?? null)
   const [state, formAction, pending] = useActionState(action, initialState)
 
-  const [date, setDate] = useState(
-    editing ? localDateKey(new Date(editing.startsAt), props.timezone) : (props.defaultDate ?? ''),
-  )
-  const [startTime, setStartTime] = useState(
-    editing ? localTimeLabel(editing.startsAt, props.timezone) : (props.defaultTime ?? '09:00'),
-  )
-  const [endTime, setEndTime] = useState(
-    editing
+  const [draft, setDraft] = useState<AppointmentDraft>(() => ({
+    patientId: editing?.patientId ?? props.defaultPatientId ?? '',
+    professionalId: editing?.professionalId ?? props.defaultProfessionalId ?? '',
+    serviceId: editing?.serviceId ?? '',
+    date: editing
+      ? localDateKey(new Date(editing.startsAt), props.timezone)
+      : (props.defaultDate ?? ''),
+    startTime: editing
+      ? localTimeLabel(editing.startsAt, props.timezone)
+      : (props.defaultTime ?? '09:00'),
+    endTime: editing
       ? localTimeLabel(editing.endsAt, props.timezone)
       : addMinutes(props.defaultTime ?? '09:00', 30),
-  )
-  const [serviceId, setServiceId] = useState(editing?.serviceId ?? '')
+    notes: editing?.notes ?? '',
+  }))
+  const patch = (changes: Partial<AppointmentDraft>) =>
+    setDraft((current) => ({ ...current, ...changes }))
 
   useEffect(() => {
     if (state.ok) props.onSaved()
@@ -71,19 +77,42 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
 
   /** Escolher servico calcula o fim pela duracao; sem servico, o fim e manual. */
   function applyService(nextServiceId: string): void {
-    setServiceId(nextServiceId)
     const service = props.services.find((s) => s.id === nextServiceId)
-    if (service) setEndTime(addMinutes(startTime, service.durationMinutes))
+    patch({
+      serviceId: nextServiceId,
+      ...(service ? { endTime: addMinutes(draft.startTime, service.durationMinutes) } : {}),
+    })
   }
 
   function applyStart(nextStart: string): void {
-    setStartTime(nextStart)
-    const service = props.services.find((s) => s.id === serviceId)
-    if (service) setEndTime(addMinutes(nextStart, service.durationMinutes))
+    const service = props.services.find((s) => s.id === draft.serviceId)
+    patch({
+      startTime: nextStart,
+      ...(service ? { endTime: addMinutes(nextStart, service.durationMinutes) } : {}),
+    })
   }
 
-  const startsAtIso = date ? instantFromLocal(date, startTime, props.timezone).toISOString() : ''
-  const endsAtIso = date ? instantFromLocal(date, endTime, props.timezone).toISOString() : ''
+  /*
+   * `<form action={fn}>` faz o React resetar o formulario quando a action termina,
+   * e o reset volta os <select> ao padrao mesmo com `value` controlado: o estado
+   * continua certo, mas a tela e o envio passavam a dizer "vazio". O aviso do
+   * servidor e uma action que termina sem salvar, entao um reset ali apagava o
+   * rascunho. Por isso o envio sai daqui, e sempre a partir do rascunho.
+   *
+   * O fingerprint e o dos avisos exibidos. Se a situacao mudar, o servidor recusa e
+   * devolve os avisos novos.
+   */
+  function submit(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    const form = draftToFormData(draft, props.timezone, state.fingerprint)
+    startTransition(() => formAction(form))
+  }
+
+  // Um servico desativado nao vem na lista, mas continua sendo o deste agendamento.
+  const servicoForaDaLista =
+    editing?.serviceId && !props.services.some((s) => s.id === editing.serviceId)
+      ? { id: editing.serviceId, name: editing.serviceName ?? 'Servico atual' }
+      : null
 
   const nextStatuses = editing ? APPOINTMENT_STATUS_TRANSITIONS[editing.status] : []
 
@@ -97,25 +126,13 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
           </button>
         </div>
 
-        <form action={formAction}>
-          {/* Instantes absolutos calculados no fuso da clinica. */}
-          <input type="hidden" name="startsAt" value={startsAtIso} />
-          <input type="hidden" name="endsAt" value={endsAtIso} />
-          {/*
-            Confirmacao consciente: reenvia o fingerprint EXATO dos avisos que
-            foram exibidos. Se a situacao mudar, o servidor recusa e devolve os
-            avisos novos.
-          */}
-          {state.fingerprint ? (
-            <input type="hidden" name="acknowledgedWarnings" value={state.fingerprint} />
-          ) : null}
-
+        <form onSubmit={submit}>
           <label>
             Paciente
             <select
-              name="patientId"
               required
-              defaultValue={editing?.patientId ?? props.defaultPatientId ?? ''}
+              value={draft.patientId}
+              onChange={(event) => patch({ patientId: event.target.value })}
             >
               <option value="">Selecione…</option>
               {props.patients.map((patient) => (
@@ -129,9 +146,9 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
           <label>
             Profissional
             <select
-              name="professionalId"
               required
-              defaultValue={editing?.professionalId ?? props.defaultProfessionalId ?? ''}
+              value={draft.professionalId}
+              onChange={(event) => patch({ professionalId: event.target.value })}
             >
               <option value="">Selecione…</option>
               {props.professionals.map((professional) => (
@@ -144,12 +161,11 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
 
           <label>
             Servico (opcional)
-            <select
-              name="serviceId"
-              value={serviceId}
-              onChange={(event) => applyService(event.target.value)}
-            >
+            <select value={draft.serviceId} onChange={(event) => applyService(event.target.value)}>
               <option value="">Sem servico — duracao manual</option>
+              {servicoForaDaLista ? (
+                <option value={servicoForaDaLista.id}>{servicoForaDaLista.name}</option>
+              ) : null}
               {props.services.map((service) => (
                 <option key={service.id} value={service.id}>
                   {service.name} ({service.durationMinutes} min)
@@ -164,8 +180,8 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
               <input
                 type="date"
                 required
-                value={date}
-                onChange={(event) => setDate(event.target.value)}
+                value={draft.date}
+                onChange={(event) => patch({ date: event.target.value })}
               />
             </label>
             <label>
@@ -173,7 +189,7 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
               <input
                 type="time"
                 required
-                value={startTime}
+                value={draft.startTime}
                 onChange={(event) => applyStart(event.target.value)}
               />
             </label>
@@ -182,15 +198,20 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
               <input
                 type="time"
                 required
-                value={endTime}
-                onChange={(event) => setEndTime(event.target.value)}
+                value={draft.endTime}
+                onChange={(event) => patch({ endTime: event.target.value })}
               />
             </label>
           </div>
 
           <label>
             Observacoes
-            <input type="text" name="notes" defaultValue={editing?.notes ?? ''} maxLength={2000} />
+            <input
+              type="text"
+              value={draft.notes}
+              onChange={(event) => patch({ notes: event.target.value })}
+              maxLength={2000}
+            />
           </label>
 
           {state.warnings && state.warnings.length > 0 ? (
