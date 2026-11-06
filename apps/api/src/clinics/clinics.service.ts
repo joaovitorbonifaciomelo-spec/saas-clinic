@@ -65,14 +65,17 @@ export class ClinicsService {
   }
 
   /**
-   * Clinicas do usuario. Nao ha filtro por user_id na query de proposito: o RLS
-   * ja restringe clinic_members ao proprio usuario. Filtrar aqui daria a falsa
-   * impressao de que a seguranca mora no application code.
+   * Clinicas do usuario, com o papel DELE em cada uma.
+   *
+   * O filtro por user_id e necessario: a policy de clinic_members deixa o membro
+   * ver todos os colegas da clinica. Sem ele, cada colega virava uma "membership"
+   * deste usuario, e o papel exibido era o do membro mais antigo.
    */
-  async listMemberships(): Promise<ClinicMembership[]> {
+  async listMemberships(userId: string): Promise<ClinicMembership[]> {
     const { data, error } = await this.supabase
       .from('clinic_members')
       .select('clinic_id, role, clinics ( id, name, timezone )')
+      .eq('user_id', userId)
       .order('created_at', { ascending: true })
 
     if (error) throw mapPostgrestError(error)

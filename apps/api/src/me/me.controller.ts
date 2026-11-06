@@ -31,7 +31,7 @@ export class MeController {
       throw new NotFoundException('Perfil nao encontrado.')
     }
 
-    const memberships = await this.clinics.listMemberships()
+    const memberships = await this.clinics.listMemberships(user.id)
 
     return {
       profile: { id: data.id, fullName: data.full_name, email: user.email },

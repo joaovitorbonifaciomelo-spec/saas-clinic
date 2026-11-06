@@ -6,7 +6,8 @@ import {
   type ClinicMembership,
 } from '@clinicas/shared'
 import type { CreateClinicInput } from '@clinicas/shared'
-import { AuthGuard } from '../auth/auth.guard'
+import { AuthGuard, type AuthenticatedUser } from '../auth/auth.guard'
+import { CurrentUser } from '../auth/current-user.decorator'
 import { ActiveClinicId } from './active-clinic.decorator'
 import { ClinicMembershipGuard } from './clinic-membership.guard'
 import { ZodValidationPipe } from '../common/zod-validation.pipe'
@@ -18,8 +19,8 @@ export class ClinicsController {
   constructor(private readonly clinics: ClinicsService) {}
 
   @Get()
-  list(): Promise<ClinicMembership[]> {
-    return this.clinics.listMemberships()
+  list(@CurrentUser() user: AuthenticatedUser): Promise<ClinicMembership[]> {
+    return this.clinics.listMemberships(user.id)
   }
 
   /**
