@@ -1,0 +1,111 @@
+# =============================================================================
+# Clinic SaaS - Production. Vai para /opt/clinic-saas-production/docker-compose.yml
+# e usa /opt/clinic-saas-production/.env (modelo: clinic-saas-production.env.example).
+#
+# Internet -> caddy -> web -> api -> Supabase Production
+#
+# Stack isolada: rede propria, sem depender de nenhum outro projeto da VPS.
+# Variavel obrigatoria ausente derruba o `docker compose` com o nome dela. Nao ha
+# valor padrao de proposito, para nada cair no Supabase de Development por engano.
+# =============================================================================
+name: clinic-saas-production
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+services:
+  caddy:
+    image: caddy:2.11.9-alpine
+    container_name: clinic-saas-production-caddy
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    # Unico servico publicado, e so no IP publico. O tailscaled ja ouve na 443 do
+    # IP do Tailscale: um bind em 0.0.0.0:443 entraria em conflito com ele.
+    ports:
+      - '${PUBLIC_IP:?defina PUBLIC_IP no .env}:80:80/tcp'
+      - '${PUBLIC_IP:?defina PUBLIC_IP no .env}:443:443/tcp'
+    environment:
+      PRODUCTION_HOST: ${PRODUCTION_HOST:?defina PRODUCTION_HOST no .env}
+      ACME_EMAIL: ${ACME_EMAIL:?defina ACME_EMAIL no .env}
+    volumes:
+      - ./clinic-saas-production.Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    mem_limit: 128m
+    cpus: 0.25
+    cpu_shares: 512
+    logging: *logging
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:2019/config/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks: [clinic-saas-production-net]
+
+  web:
+    # Referencia completa, sempre por SHA. Os NEXT_PUBLIC_* ja estao na imagem.
+    image: ${WEB_IMAGE:?defina WEB_IMAGE=ghcr.io/...:sha-<commit> no .env}
+    container_name: clinic-saas-production-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_OPTIONS: --max-old-space-size=384
+    mem_limit: 512m
+    cpus: 0.5
+    # Metade do peso padrao: em disputa pelo unico nucleo, a automacao vem primeiro.
+    cpu_shares: 512
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+    # O healthcheck vem da imagem (docker/web.Dockerfile).
+    networks: [clinic-saas-production-net]
+
+  api:
+    image: ${API_IMAGE:?defina API_IMAGE=ghcr.io/...:sha-<commit> no .env}
+    container_name: clinic-saas-production-api
+    restart: unless-stopped
+    # Sem `ports`: a 3333 existe so dentro da rede da stack.
+    environment:
+      NODE_ENV: production
+      API_PORT: 3333
+      SUPABASE_URL: ${SUPABASE_URL:?defina SUPABASE_URL no .env}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:?defina SUPABASE_ANON_KEY no .env}
+      # Origem unica do CORS. A API recusa subir em producao sem ela.
+      WEB_ORIGIN: ${WEB_ORIGIN:?defina WEB_ORIGIN=https://HOST no .env}
+      NODE_OPTIONS: --max-old-space-size=256
+    mem_limit: 384m
+    cpus: 0.5
+    cpu_shares: 512
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3333/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [clinic-saas-production-net]
+
+volumes:
+  # Certificados e conta ACME: precisam sobreviver a recriacao do container.
+  caddy-data:
+    name: clinic-saas-production-caddy-data
+  caddy-config:
+    name: clinic-saas-production-caddy-config
+
+networks:
+  clinic-saas-production-net:
+    name: clinic-saas-production-net
