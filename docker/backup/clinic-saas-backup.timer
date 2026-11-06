@@ -1,0 +1,11 @@
+[Unit]
+Description=Backup diario do Clinic SaaS Production
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 America/Sao_Paulo
+# Se a VPS estiver desligada as 03:00, roda assim que voltar.
+Persistent=true
+Unit=clinic-saas-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Backup logico do Clinic SaaS Production
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/clinic-saas-production/bin/clinic-saas-backup.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
