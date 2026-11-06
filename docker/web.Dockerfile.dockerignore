@@ -1,0 +1,29 @@
+# Usado pelo BuildKit no lugar do .dockerignore da raiz quando o Dockerfile e
+# docker/web.Dockerfile. O da raiz e o da API e exclui apps/web.
+#
+# Lista de permissao: exclui tudo e reinclui so o que o build do frontend usa.
+# Arquivo novo na raiz fica fora por padrao, inclusive um .env esquecido.
+*
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!tsconfig.base.json
+!packages/
+!apps/
+apps/*
+!apps/web/
+!apps/api/
+apps/api/*
+!apps/api/package.json
+
+# Artefatos: reconstruidos dentro da imagem.
+**/node_modules
+**/dist
+**/.next
+**/coverage
+**/*.log
+**/*.tsbuildinfo
+
+# Segredos: nunca entram no contexto de build.
+**/.env
+**/.env.*
