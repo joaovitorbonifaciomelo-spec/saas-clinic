@@ -1,4 +1,3 @@
-import Link from 'next/link'
 import { notFound } from 'next/navigation'
 import type { Patient } from '@clinicas/shared'
 import { ApiError, apiFetch } from '../../../../../lib/api'
@@ -23,12 +22,16 @@ export default async function EditPatientPage({ params }: { params: Promise<{ id
   const action = updatePatientAction.bind(null, patient.id)
 
   return (
-    <main className="container narrow">
-      <h1>Editar paciente</h1>
-      <PatientForm action={action} patient={patient} submitLabel="Salvar alteracoes" />
-      <p>
-        <Link href={`/patients?p=${patient.id}`}>Voltar</Link>
-      </p>
-    </main>
+    <div className="content">
+      <div className="page-head">
+        <h1>Editar paciente</h1>
+      </div>
+      <PatientForm
+        action={action}
+        patient={patient}
+        submitLabel="Salvar alteracoes"
+        cancelHref={`/patients?p=${patient.id}`}
+      />
+    </div>
   )
 }

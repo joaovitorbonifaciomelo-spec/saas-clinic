@@ -11,13 +11,15 @@ interface PatientFormProps {
   action: (prev: PatientFormState, formData: FormData) => Promise<PatientFormState>
   patient?: Patient
   submitLabel: string
+  /** Para onde o "Cancelar" volta. */
+  cancelHref?: string
 }
 
-export function PatientForm({ action, patient, submitLabel }: PatientFormProps) {
+export function PatientForm({ action, patient, submitLabel, cancelHref }: PatientFormProps) {
   const [state, formAction, pending] = useActionState(action, initialState)
 
   return (
-    <form action={formAction} className="card">
+    <form action={formAction} className="card form-card">
       <label>
         Nome
         <input name="name" type="text" required defaultValue={patient?.name ?? ''} />
@@ -45,11 +47,13 @@ export function PatientForm({ action, patient, submitLabel }: PatientFormProps) 
         />
       </label>
       {state.error ? <p className="error">{state.error}</p> : null}
-      <div className="row">
+      <div className="form-actions">
         <button type="submit" disabled={pending}>
           {pending ? 'Salvando...' : submitLabel}
         </button>
-        <Link href="/patients">Cancelar</Link>
+        <Link href={cancelHref ?? '/patients'} className="btn secondary">
+          Cancelar
+        </Link>
       </div>
     </form>
   )

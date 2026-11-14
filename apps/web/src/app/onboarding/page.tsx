@@ -12,7 +12,7 @@ export default function OnboardingPage() {
     <main className="container narrow">
       <h1>Criar sua clinica</h1>
       <p className="muted">Voce sera o administrador dela.</p>
-      <form action={formAction} className="card">
+      <form action={formAction} className="card form-card">
         <label>
           Nome da clinica
           <input name="name" type="text" required minLength={2} maxLength={120} />
