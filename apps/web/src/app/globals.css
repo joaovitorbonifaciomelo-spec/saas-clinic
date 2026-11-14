@@ -4547,3 +4547,76 @@ th.num {
     align-items: stretch;
   }
 }
+
+/* =============================================================================
+   BUSCA DE PACIENTE NO AGENDAMENTO
+   ============================================================================= */
+.picker-field {
+  margin-bottom: 10px;
+}
+.picker-field > label {
+  margin-bottom: 5px;
+}
+.picker {
+  position: relative;
+}
+.picker-list {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  box-shadow: 0 8px 24px rgba(15, 27, 45, 0.12);
+}
+.picker-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 8px;
+  font-size: 13px;
+  border-radius: calc(var(--r) - 2px);
+  cursor: pointer;
+}
+.picker-list li.active {
+  background: var(--surface-hover);
+}
+.picker-list .picker-empty {
+  color: var(--muted);
+  cursor: default;
+}
+.picker-list .picker-new {
+  color: var(--brand);
+  font-weight: 550;
+  border-top: 1px solid var(--line-soft);
+  margin-top: 2px;
+}
+.picker-create {
+  margin-top: 8px;
+  padding: 12px;
+  background: var(--surface-sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.picker-create-title {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.picker-create .faint {
+  font-size: 12px;
+  margin: 0 0 8px;
+}
+.picker-create-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

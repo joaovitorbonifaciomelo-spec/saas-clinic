@@ -1,6 +1,6 @@
 'use client'
 
-import { startTransition, useActionState, useEffect, useState, type FormEvent } from 'react'
+import { startTransition, useActionState, useEffect, useId, useState, type FormEvent } from 'react'
 import {
   APPOINTMENT_STATUS_LABELS,
   APPOINTMENT_STATUS_TRANSITIONS,
@@ -17,6 +17,7 @@ import {
   type AgendaActionState,
 } from './agenda-actions'
 import { draftToFormData, type AppointmentDraft } from './appointment-draft'
+import { PatientPicker, type PatientOption } from './patient-picker'
 import { localDateKey, localTimeLabel } from './agenda-time'
 import { NovaPendencia } from '../pendencias/nova-pendencia'
 import { IconPlus } from '../../ui/icons'
@@ -69,6 +70,15 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
   const patch = (changes: Partial<AppointmentDraft>) =>
     setDraft((current) => ({ ...current, ...changes }))
 
+  // Pacientes cadastrados aqui mesmo entram na lista sem esperar a agenda recarregar.
+  const [novosPacientes, setNovosPacientes] = useState<PatientOption[]>([])
+  const pacientes = [
+    ...novosPacientes,
+    ...props.patients.filter((p) => !novosPacientes.some((n) => n.id === p.id)),
+  ]
+  const pacienteInputId = useId()
+  const [erroPaciente, setErroPaciente] = useState<string | null>(null)
+
   useEffect(() => {
     if (state.ok) props.onSaved()
     // Observar apenas state.ok e proposital: reagir a mudanca do callback
@@ -104,6 +114,11 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
    */
   function submit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault()
+    // A busca nao e um <select required>: sem paciente escolhido, avisa aqui.
+    if (!draft.patientId) {
+      setErroPaciente('Escolha um paciente da lista ou cadastre um novo.')
+      return
+    }
     const form = draftToFormData(draft, props.timezone, state.fingerprint)
     startTransition(() => formAction(form))
   }
@@ -127,21 +142,25 @@ export function AppointmentDrawer(props: AppointmentDrawerProps) {
         </div>
 
         <form onSubmit={submit}>
-          <label>
-            Paciente
-            <select
-              required
+          <div className="picker-field">
+            <label htmlFor={pacienteInputId}>Paciente</label>
+            <PatientPicker
+              inputId={pacienteInputId}
+              patients={pacientes}
               value={draft.patientId}
-              onChange={(event) => patch({ patientId: event.target.value })}
-            >
-              <option value="">Selecione…</option>
-              {props.patients.map((patient) => (
-                <option key={patient.id} value={patient.id}>
-                  {patient.name}
-                </option>
-              ))}
-            </select>
-          </label>
+              valueLabel={editing?.patientName}
+              onChange={(patientId) => {
+                patch({ patientId })
+                if (patientId) setErroPaciente(null)
+              }}
+              onCreated={(p) => setNovosPacientes((atual) => [p, ...atual])}
+            />
+            {erroPaciente ? (
+              <p className="error" role="alert">
+                {erroPaciente}
+              </p>
+            ) : null}
+          </div>
 
           <label>
             Profissional
